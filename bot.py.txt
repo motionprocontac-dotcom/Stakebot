@@ -1,0 +1,198 @@
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, CallbackContext, CallbackQueryHandler, MessageHandler, Filters
+import feedparser
+from apscheduler.schedulers.background import BackgroundScheduler
+import random
+import config
+from telegram.error import BadRequest
+
+# --- Logging ---
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- Langue ---
+def get_user_lang(update: Update):
+    return 'fr' if update.effective_user.language_code == 'fr' else 'en'
+
+# --- Messages ---
+messages = {
+    "start": {
+        "fr": "🎲 StakeTrackerBot 🚀 Choisissez votre catégorie pour accéder aux news et outils.",
+        "en": "🎲 StakeTrackerBot 🚀 Choose your category to access news and tools."
+    },
+    "support": {
+        "fr": f"Soutenez le projet via :\nBTC: {config.BTC_WALLET}\nETH: {config.ETH_WALLET}\nLTC: {config.LTC_WALLET}",
+        "en": f"Support the project via:\nBTC: {config.BTC_WALLET}\nETH: {config.ETH_WALLET}\nLTC: {config.LTC_WALLET}"
+    },
+    "bonus": {
+        "fr": f"🎁 Bonus Stake : {config.STAKE_AFFILIATE}",
+        "en": f"🎁 Exclusive Stake bonus: {config.STAKE_AFFILIATE}"
+    },
+    "estimate_usage": {
+        "fr": "Entrez vos stats sous la forme : wager net_gain VIP_level (ex: 5000 120 Silver)",
+        "en": "Enter your stats in the format: wager net_gain VIP_level (ex: 5000 120 Silver)"
+    }
+}
+
+# --- Menus ---
+def main_menu():
+    keyboard = [
+        [InlineKeyboardButton("Stake.com", callback_data='stake_com')],
+        [InlineKeyboardButton("Stake US", callback_data='stake_us')],
+        [InlineKeyboardButton("Estimate / Outils", callback_data='estimate_tools')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def category_menu(category):
+    keyboard = [
+        [InlineKeyboardButton("News", callback_data=f'news_{category}'),
+         InlineKeyboardButton("Trending", callback_data=f'trending_{category}')],
+        [InlineKeyboardButton("Top Wins", callback_data=f'topwins_{category}'),
+         InlineKeyboardButton("Estimate", callback_data=f'estimate_{category}')],
+        [InlineKeyboardButton("Support", callback_data='support'),
+         InlineKeyboardButton("Bonus", callback_data='bonus')],
+        [InlineKeyboardButton("Back", callback_data='back_main')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# --- Check if user follows channel ---
+def check_subscription(update, context):
+    user_id = update.effective_user.id
+    channel = config.CHANNEL_EN
+    try:
+        member = context.bot.get_chat_member(chat_id=channel, user_id=user_id)
+        if member.status in ['creator', 'administrator', 'member']:
+            return True
+    except BadRequest:
+        return False
+    return False
+
+# --- Command Handlers ---
+def start(update: Update, context: CallbackContext):
+    if not check_subscription(update, context):
+        keyboard = [[InlineKeyboardButton("Rejoindre le channel", url=f"https://t.me/{config.CHANNEL_EN.replace('@','')}")]]
+        update.message.reply_text(
+            "👋 Bonjour ! Pour accéder au bot, rejoignez d’abord notre channel officiel :",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    lang = get_user_lang(update)
+    update.message.reply_text(messages["start"][lang], reply_markup=main_menu())
+
+def button(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    data = query.data
+    lang = get_user_lang(update)
+
+    if data == 'back_main':
+        query.edit_message_text(messages["start"][lang], reply_markup=main_menu())
+        return
+
+    if data.startswith('stake_com'):
+        query.edit_message_text("Stake.com menu:", reply_markup=category_menu('com'))
+        return
+    if data.startswith('stake_us'):
+        query.edit_message_text("Stake US menu:", reply_markup=category_menu('us'))
+        return
+    if data.startswith('estimate_tools'):
+        query.edit_message_text(messages["estimate_usage"][lang])
+        return
+
+    if data.startswith('news_'):
+        category = data.split('_')[1]
+        posts_text = get_rss_posts(category, type_='news')
+        query.edit_message_text(posts_text, reply_markup=category_menu(category))
+        return
+
+    if data.startswith('trending_'):
+        category = data.split('_')[1]
+        posts_text = get_rss_posts(category, type_='trending')
+        query.edit_message_text(posts_text, reply_markup=category_menu(category))
+        return
+
+    if data.startswith('topwins_'):
+        category = data.split('_')[1]
+        posts_text = get_top_wins(category)
+        query.edit_message_text(posts_text, reply_markup=category_menu(category))
+        return
+
+    if data.startswith('estimate_'):
+        query.edit_message_text(messages["estimate_usage"][lang])
+        return
+
+    if data == 'support':
+        query.edit_message_text(messages["support"][lang])
+        return
+    if data == 'bonus':
+        query.edit_message_text(messages["bonus"][lang])
+        return
+
+# --- RSS functions ---
+def get_rss_posts(category, type_='news'):
+    url = config.RSS_STAKE_COM if category=='com' else config.RSS_STAKE_US
+    feed = feedparser.parse(url)
+    entries = feed.entries[:5]
+    text_list = []
+    for entry in entries:
+        text_list.append(f"🔥 {entry.title}\n🔗 {entry.link}")
+    return "\n\n".join(text_list) if text_list else "No posts available."
+
+def get_top_wins(category):
+    if category=='com':
+        simulated_wins = ["$50k – Plinko", "$120k – Blackjack", "$200k – Dice"]
+    else:
+        simulated_wins = ["$30k – Dice", "$80k – Blackjack", "$100k – Plinko"]
+    return "Top wins:\n" + "\n".join(simulated_wins)
+
+# --- Estimation multi-périodes ---
+user_stats = {}
+
+def handle_estimate_input(update: Update, context: CallbackContext):
+    try:
+        args = update.message.text.split()
+        if len(args) < 3:
+            update.message.reply_text("Format invalide. Example: 5000 120 Silver")
+            return
+        wager = float(args[0])
+        net_gain = float(args[1])
+        vip = args[2]
+
+        user_id = update.effective_user.id
+        if user_id not in user_stats:
+            user_stats[user_id] = []
+        user_stats[user_id].append({"wager": wager, "net_gain": net_gain, "vip": vip})
+
+        lower = round(net_gain * 0.8 + random.randint(-10,10))
+        upper = round(net_gain * 1.2 + random.randint(-10,10))
+
+        update.message.reply_text(f"📊 Estimated monthly range:\n${lower} – ${upper}\nConfidence: Medium\nBased on Reddit posts")
+    except:
+        update.message.reply_text("Erreur dans le calcul de l'estimation.")
+
+# --- Main ---
+updater = Updater(config.TELEGRAM_TOKEN, use_context=True)
+dp = updater.dispatcher
+
+dp.add_handler(CommandHandler("start", start))
+dp.add_handler(CallbackQueryHandler(button))
+dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_estimate_input))
+
+# --- Scheduler automatique ---
+from telegram import Bot
+from apscheduler.schedulers.background import BackgroundScheduler
+
+def scrape_rss_channel():
+    bot = Bot(token=config.TELEGRAM_TOKEN)
+    posts_com = get_rss_posts('com', type_='news')
+    bot.send_message(chat_id=config.CHANNEL_EN, text="#Stake.com News\n\n"+posts_com)
+    posts_us = get_rss_posts('us', type_='news')
+    bot.send_message(chat_id=config.CHANNEL_EN, text="#Stake US News\n\n"+posts_us)
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(scrape_rss_channel, 'interval', minutes=15)
+scheduler.start()
+
+updater.start_polling()
+updater.idle()
